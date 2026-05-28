@@ -66,7 +66,7 @@ A real-time multiplayer stock trading game for the classroom. Players compete to
 ### Install
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/ak2106-47/Stock-Sprint
 cd stock-sprint
 npm install
 ```
