@@ -1,6 +1,6 @@
 # Stock Sprint
 
-A real-time multiplayer stock trading game for the classroom. Players compete to grow a virtual $10,000 portfolio by buying and selling stocks as live news events move the market — all from their phones while a host projects the game on screen.
+A real-time multiplayer stock trading game for the classroom. Players compete to grow a virtual $10,000 portfolio by buying and selling stocks as live news events move the market — all from their phones while a host projects the game on screen....
 
 ---
 
