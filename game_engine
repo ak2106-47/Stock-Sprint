@@ -1,0 +1,448 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const GAME_DURATION = 60;
+const TICK_MS = 200;
+const STARTING_CASH = 10000;
+const MAX_HISTORY = 200;
+
+const STOCKS = [
+  { symbol: "BNNA", name: "Banana Inc.", color: "#FFD600", volatility: 0.025, drift: 0.001, basePrice: 42 },
+  { symbol: "REKT", name: "RektCoin Ltd.", color: "#FF3D71", volatility: 0.06, drift: -0.002, basePrice: 7 },
+  { symbol: "MOON", name: "MoonShot AI", color: "#00E5FF", volatility: 0.04, drift: 0.003, basePrice: 120 },
+  { symbol: "SAFE", name: "SafeHaven Bonds", color: "#76FF03", volatility: 0.008, drift: 0.0005, basePrice: 95 },
+];
+
+function generatePrice(prev, stock) {
+  const shock = (Math.random() - 0.5) * 2 * stock.volatility;
+  const crash = Math.random() < 0.005 ? (Math.random() > 0.5 ? 0.12 : -0.12) : 0;
+  const next = prev * (1 + shock + stock.drift + crash);
+  return Math.max(0.01, parseFloat(next.toFixed(2)));
+}
+
+function MiniChart({ history, color, width = 120, height = 40 }) {
+  if (history.length < 2) return null;
+  const min = Math.min(...history);
+  const max = Math.max(...history);
+  const range = max - min || 1;
+  const points = history.map((v, i) => {
+    const x = (i / (history.length - 1)) * width;
+    const y = height - ((v - min) / range) * (height - 4) - 2;
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function BigChart({ histories, stocks, selectedIdx }) {
+  const W = 600, H = 200;
+  const stock = stocks[selectedIdx];
+  const history = histories[selectedIdx];
+  if (history.length < 2) return <div style={{ width: W, height: H }} />;
+  const min = Math.min(...history) * 0.98;
+  const max = Math.max(...history) * 1.02;
+  const range = max - min || 1;
+  const points = history.map((v, i) => {
+    const x = (i / (MAX_HISTORY - 1)) * W;
+    const y = H - ((v - min) / range) * (H - 20) - 10;
+    return `${x},${y}`;
+  }).join(" ");
+  const lastY = H - ((history[history.length - 1] - min) / range) * (H - 20) - 10;
+
+  const gridLines = [];
+  for (let i = 0; i <= 4; i++) {
+    const y = 10 + (i / 4) * (H - 20);
+    const val = max - (i / 4) * range;
+    gridLines.push(
+      <g key={i}>
+        <line x1="0" y1={y} x2={W} y2={y} stroke="rgba(255,255,255,0.07)" strokeWidth="1" />
+        <text x={W - 4} y={y - 4} fill="rgba(255,255,255,0.3)" fontSize="10" textAnchor="end" fontFamily="'IBM Plex Mono', monospace">${val.toFixed(2)}</text>
+      </g>
+    );
+  }
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", borderRadius: 8, background: "rgba(0,0,0,0.3)" }}>
+      {gridLines}
+      <polyline points={points} fill="none" stroke={stock.color} strokeWidth="2.5" strokeLinejoin="round" opacity="0.9" />
+      <circle cx={(history.length - 1) / (MAX_HISTORY - 1) * W} cy={lastY} r="4" fill={stock.color} />
+      <text x="8" y="20" fill={stock.color} fontSize="14" fontWeight="700" fontFamily="'Press Start 2P', monospace">{stock.symbol}</text>
+      <text x="8" y="36" fill="rgba(255,255,255,0.5)" fontSize="10" fontFamily="'IBM Plex Mono', monospace">{stock.name}</text>
+    </svg>
+  );
+}
+
+const BADGES = [
+  { id: "first_trade", label: "First Trade", icon: "🏁", check: (s) => s.totalTrades >= 1 },
+  { id: "profit", label: "In The Green", icon: "💚", check: (s) => s.finalValue > STARTING_CASH },
+  { id: "double", label: "Doubled Up", icon: "🚀", check: (s) => s.finalValue >= STARTING_CASH * 2 },
+  { id: "diamond", label: "Diamond Hands", icon: "💎", check: (s) => s.longestHold >= 20 },
+  { id: "trader", label: "Day Trader", icon: "📈", check: (s) => s.totalTrades >= 15 },
+  { id: "diversified", label: "Diversified", icon: "🎯", check: (s) => s.uniqueStocks >= 3 },
+  { id: "whale", label: "Whale", icon: "🐋", check: (s) => s.biggestPosition >= 5000 },
+  { id: "rekt", label: "Got REKT", icon: "💀", check: (s) => s.finalValue < STARTING_CASH * 0.5 },
+];
+
+export default function CoolFinanceGame() {
+  const [screen, setScreen] = useState("menu");
+  const [cash, setCash] = useState(STARTING_CASH);
+  const [holdings, setHoldings] = useState({});
+  const [prices, setPrices] = useState(STOCKS.map(s => s.basePrice));
+  const [histories, setHistories] = useState(STOCKS.map(s => [s.basePrice]));
+  const [timeLeft, setTimeLeft] = useState(GAME_DURATION);
+  const [selectedStock, setSelectedStock] = useState(0);
+  const [tradeQty, setTradeQty] = useState(1);
+  const [flash, setFlash] = useState(null);
+  const [stats, setStats] = useState(null);
+
+  const gameRef = useRef({ cash: STARTING_CASH, holdings: {}, prices: STOCKS.map(s => s.basePrice), trades: 0, uniqueStocks: new Set(), holdTicks: {}, longestHold: 0, biggestPosition: 0 });
+  const timerRef = useRef(null);
+  const tickRef = useRef(null);
+
+  const getPortfolioValue = useCallback((c, h, p) => {
+    let val = c;
+    Object.entries(h).forEach(([idx, qty]) => { val += qty * p[parseInt(idx)]; });
+    return val;
+  }, []);
+
+  const startGame = () => {
+    const initPrices = STOCKS.map(s => s.basePrice);
+    setCash(STARTING_CASH);
+    setHoldings({});
+    setPrices(initPrices);
+    setHistories(STOCKS.map(s => [s.basePrice]));
+    setTimeLeft(GAME_DURATION);
+    setSelectedStock(0);
+    setTradeQty(1);
+    setFlash(null);
+    setStats(null);
+    gameRef.current = { cash: STARTING_CASH, holdings: {}, prices: initPrices, trades: 0, uniqueStocks: new Set(), holdTicks: {}, longestHold: 0, biggestPosition: 0 };
+    setScreen("play");
+  };
+
+  useEffect(() => {
+    if (screen !== "play") {
+      clearInterval(timerRef.current);
+      clearInterval(tickRef.current);
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      setTimeLeft(t => {
+        if (t <= 1) {
+          clearInterval(timerRef.current);
+          clearInterval(tickRef.current);
+          const g = gameRef.current;
+          const fv = getPortfolioValue(g.cash, g.holdings, g.prices);
+          const s = {
+            finalValue: fv,
+            totalTrades: g.trades,
+            uniqueStocks: g.uniqueStocks.size,
+            longestHold: g.longestHold,
+            biggestPosition: g.biggestPosition,
+            returnPct: ((fv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1),
+          };
+          setStats(s);
+          setScreen("results");
+          return 0;
+        }
+        return t - 1;
+      });
+    }, 1000);
+
+    tickRef.current = setInterval(() => {
+      setPrices(prev => {
+        const next = prev.map((p, i) => generatePrice(p, STOCKS[i]));
+        gameRef.current.prices = next;
+        return next;
+      });
+      setHistories(prev => prev.map((h, i) => {
+        const newH = [...h, gameRef.current.prices[i]];
+        return newH.length > MAX_HISTORY ? newH.slice(-MAX_HISTORY) : newH;
+      }));
+      const g = gameRef.current;
+      Object.keys(g.holdings).forEach(idx => {
+        g.holdTicks[idx] = (g.holdTicks[idx] || 0) + 1;
+        g.longestHold = Math.max(g.longestHold, g.holdTicks[idx]);
+      });
+    }, TICK_MS);
+
+    return () => { clearInterval(timerRef.current); clearInterval(tickRef.current); };
+  }, [screen, getPortfolioValue]);
+
+  const doTrade = (type) => {
+    const g = gameRef.current;
+    const price = prices[selectedStock];
+    const qty = tradeQty;
+    if (type === "buy") {
+      const cost = price * qty;
+      if (cost > cash) {
+        showFlash("NOT ENOUGH CASH", "#FF3D71"); return;
+      }
+      const newCash = cash - cost;
+      const newHoldings = { ...holdings, [selectedStock]: (holdings[selectedStock] || 0) + qty };
+      setCash(newCash); setHoldings(newHoldings);
+      g.cash = newCash; g.holdings = newHoldings;
+      g.trades++; g.uniqueStocks.add(selectedStock);
+      const posVal = newHoldings[selectedStock] * price;
+      g.biggestPosition = Math.max(g.biggestPosition, posVal);
+      if (!g.holdTicks[selectedStock]) g.holdTicks[selectedStock] = 0;
+      showFlash(`BOUGHT ${qty} ${STOCKS[selectedStock].symbol}`, "#76FF03");
+    } else {
+      const held = holdings[selectedStock] || 0;
+      if (held < qty) { showFlash("NOT ENOUGH SHARES", "#FF3D71"); return; }
+      const revenue = price * qty;
+      const newCash = cash + revenue;
+      const newHoldings = { ...holdings };
+      newHoldings[selectedStock] = held - qty;
+      if (newHoldings[selectedStock] === 0) {
+        delete newHoldings[selectedStock];
+        delete g.holdTicks[selectedStock];
+      }
+      setCash(newCash); setHoldings(newHoldings);
+      g.cash = newCash; g.holdings = newHoldings; g.trades++;
+      showFlash(`SOLD ${qty} ${STOCKS[selectedStock].symbol}`, "#FFD600");
+    }
+  };
+
+  const showFlash = (msg, color) => {
+    setFlash({ msg, color });
+    setTimeout(() => setFlash(null), 1200);
+  };
+
+  const portfolioValue = getPortfolioValue(cash, holdings, prices);
+  const pnl = portfolioValue - STARTING_CASH;
+
+  if (screen === "menu") return <MenuScreen onStart={startGame} />;
+  if (screen === "results") return <ResultsScreen stats={stats} onRestart={startGame} />;
+
+  const maxBuy = Math.floor(cash / prices[selectedStock]);
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#0a0e1a", color: "#fff",
+      fontFamily: "'IBM Plex Mono', 'Courier New', monospace", padding: "12px",
+      display: "flex", flexDirection: "column", gap: 10, maxWidth: 700, margin: "0 auto",
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet" />
+
+      {/* TOP BAR */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 13, color: "#FFD600", letterSpacing: 2 }}>
+          COOL FINANCE GAMES
+        </div>
+        <div style={{ display: "flex", gap: 16, alignItems: "center", fontSize: 13 }}>
+          <span style={{ color: timeLeft <= 10 ? "#FF3D71" : "#aaa" }}>⏱ {timeLeft}s</span>
+          <span style={{ color: pnl >= 0 ? "#76FF03" : "#FF3D71", fontWeight: 700 }}>
+            P&L: {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}
+          </span>
+        </div>
+      </div>
+
+      {/* PORTFOLIO BAR */}
+      <div style={{
+        background: "rgba(255,255,255,0.04)", borderRadius: 8, padding: "8px 12px",
+        display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, flexWrap: "wrap", gap: 6
+      }}>
+        <span>💵 Cash: <b style={{ color: "#76FF03" }}>${cash.toFixed(2)}</b></span>
+        <span>📊 Portfolio: <b style={{ color: "#00E5FF" }}>${portfolioValue.toFixed(2)}</b></span>
+      </div>
+
+      {/* CHART */}
+      <BigChart histories={histories} stocks={STOCKS} selectedIdx={selectedStock} />
+
+      {/* STOCK SELECTOR */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 6 }}>
+        {STOCKS.map((stock, i) => {
+          const change = histories[i].length > 1
+            ? ((prices[i] - histories[i][0]) / histories[i][0] * 100).toFixed(1) : "0.0";
+          const isUp = parseFloat(change) >= 0;
+          return (
+            <button key={stock.symbol} onClick={() => setSelectedStock(i)} style={{
+              background: selectedStock === i ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.03)",
+              border: selectedStock === i ? `2px solid ${stock.color}` : "2px solid transparent",
+              borderRadius: 8, padding: "8px", cursor: "pointer", color: "#fff",
+              textAlign: "left", transition: "all 0.15s",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ color: stock.color, fontWeight: 700, fontSize: 13 }}>{stock.symbol}</span>
+                <span style={{ color: isUp ? "#76FF03" : "#FF3D71", fontSize: 11 }}>{isUp ? "▲" : "▼"}{change}%</span>
+              </div>
+              <div style={{ fontSize: 16, fontWeight: 700, margin: "2px 0" }}>${prices[i].toFixed(2)}</div>
+              <MiniChart history={histories[i].slice(-60)} color={stock.color} width={120} height={28} />
+              {holdings[i] && <div style={{ fontSize: 10, color: "#aaa", marginTop: 3 }}>Holding: {holdings[i]} shares</div>}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* TRADE CONTROLS */}
+      <div style={{
+        background: "rgba(255,255,255,0.04)", borderRadius: 10, padding: 12,
+        display: "flex", flexDirection: "column", gap: 10,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: "#aaa" }}>QTY:</span>
+          {[1, 5, 10, 25].map(q => (
+            <button key={q} onClick={() => setTradeQty(q)} style={{
+              background: tradeQty === q ? STOCKS[selectedStock].color : "rgba(255,255,255,0.08)",
+              color: tradeQty === q ? "#0a0e1a" : "#fff",
+              border: "none", borderRadius: 6, padding: "6px 14px", cursor: "pointer",
+              fontWeight: 700, fontSize: 13, fontFamily: "'IBM Plex Mono', monospace",
+            }}>{q}</button>
+          ))}
+          <button onClick={() => setTradeQty(maxBuy)} style={{
+            background: tradeQty === maxBuy && maxBuy > 0 ? STOCKS[selectedStock].color : "rgba(255,255,255,0.08)",
+            color: tradeQty === maxBuy && maxBuy > 0 ? "#0a0e1a" : "#fff",
+            border: "none", borderRadius: 6, padding: "6px 14px", cursor: "pointer",
+            fontWeight: 700, fontSize: 13, fontFamily: "'IBM Plex Mono', monospace",
+          }}>MAX</button>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => doTrade("buy")} style={{
+            flex: 1, background: "#76FF03", color: "#0a0e1a", border: "none", borderRadius: 8,
+            padding: "12px", fontSize: 16, fontWeight: 700, cursor: "pointer",
+            fontFamily: "'Press Start 2P', monospace", letterSpacing: 1,
+          }}>BUY</button>
+          <button onClick={() => doTrade("sell")} style={{
+            flex: 1, background: "#FF3D71", color: "#fff", border: "none", borderRadius: 8,
+            padding: "12px", fontSize: 16, fontWeight: 700, cursor: "pointer",
+            fontFamily: "'Press Start 2P', monospace", letterSpacing: 1,
+          }}>SELL</button>
+        </div>
+        <div style={{ fontSize: 11, color: "#666", textAlign: "center" }}>
+          Cost: ${(prices[selectedStock] * tradeQty).toFixed(2)} · Max buy: {maxBuy}
+        </div>
+      </div>
+
+      {/* FLASH */}
+      {flash && (
+        <div style={{
+          position: "fixed", top: "50%", left: "50%", transform: "translate(-50%, -50%)",
+          background: "rgba(10,14,26,0.92)", border: `3px solid ${flash.color}`,
+          borderRadius: 12, padding: "16px 32px", color: flash.color,
+          fontFamily: "'Press Start 2P', monospace", fontSize: 14,
+          animation: "flashIn 0.3s ease-out", zIndex: 100, textAlign: "center",
+          boxShadow: `0 0 40px ${flash.color}44`,
+        }}>
+          {flash.msg}
+        </div>
+      )}
+      <style>{`@keyframes flashIn { from { opacity: 0; transform: translate(-50%, -50%) scale(0.8); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }`}</style>
+    </div>
+  );
+}
+
+function MenuScreen({ onStart }) {
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#0a0e1a", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", color: "#fff", padding: 24, textAlign: "center",
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet" />
+      <div style={{
+        fontFamily: "'Press Start 2P', monospace", fontSize: "clamp(20px, 5vw, 36px)",
+        color: "#FFD600", marginBottom: 8, lineHeight: 1.5, textShadow: "0 0 30px #FFD60066",
+      }}>
+        COOL FINANCE<br />GAMES
+      </div>
+      <div style={{ fontSize: 40, margin: "12px 0" }}>📈💸📉</div>
+      <div style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, color: "#aaa",
+        maxWidth: 420, lineHeight: 1.6, marginBottom: 24,
+      }}>
+        You have <span style={{ color: "#76FF03", fontWeight: 700 }}>$10,000</span> and <span style={{ color: "#FF3D71", fontWeight: 700 }}>60 seconds</span>.<br />
+        Buy low. Sell high. Don't get REKT.<br />
+        How much can you make?
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginBottom: 24 }}>
+        {STOCKS.map(s => (
+          <div key={s.symbol} style={{
+            background: "rgba(255,255,255,0.05)", borderRadius: 8, padding: "8px 14px",
+            border: `1px solid ${s.color}33`, fontSize: 12, fontFamily: "'IBM Plex Mono', monospace",
+          }}>
+            <span style={{ color: s.color, fontWeight: 700 }}>{s.symbol}</span>
+            <span style={{ color: "#666", marginLeft: 6 }}>{s.volatility > 0.04 ? "🔥 High Risk" : s.volatility > 0.02 ? "⚡ Medium" : "🛡️ Safe"}</span>
+          </div>
+        ))}
+      </div>
+      <button onClick={onStart} style={{
+        fontFamily: "'Press Start 2P', monospace", fontSize: 18, background: "#76FF03",
+        color: "#0a0e1a", border: "none", borderRadius: 12, padding: "16px 48px",
+        cursor: "pointer", letterSpacing: 2, boxShadow: "0 0 30px #76FF0344",
+        transition: "transform 0.1s",
+      }}
+        onMouseEnter={e => e.target.style.transform = "scale(1.05)"}
+        onMouseLeave={e => e.target.style.transform = "scale(1)"}
+      >
+        START TRADING
+      </button>
+    </div>
+  );
+}
+
+function ResultsScreen({ stats, onRestart }) {
+  const earned = BADGES.filter(b => b.check(stats));
+  const grade = stats.finalValue >= STARTING_CASH * 2 ? "S" :
+    stats.finalValue >= STARTING_CASH * 1.5 ? "A" :
+    stats.finalValue >= STARTING_CASH * 1.2 ? "B" :
+    stats.finalValue >= STARTING_CASH ? "C" :
+    stats.finalValue >= STARTING_CASH * 0.7 ? "D" : "F";
+  const gradeColor = { S: "#FFD600", A: "#76FF03", B: "#00E5FF", C: "#fff", D: "#FF9100", F: "#FF3D71" }[grade];
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#0a0e1a", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", color: "#fff", padding: 24, textAlign: "center",
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet" />
+      <div style={{ fontFamily: "'Press Start 2P', monospace", fontSize: 14, color: "#aaa", marginBottom: 8 }}>
+        MARKET CLOSED
+      </div>
+      <div style={{
+        fontFamily: "'Press Start 2P', monospace", fontSize: 72, color: gradeColor,
+        textShadow: `0 0 40px ${gradeColor}66`, margin: "8px 0",
+      }}>{grade}</div>
+      <div style={{
+        fontSize: 28, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace",
+        color: parseFloat(stats.returnPct) >= 0 ? "#76FF03" : "#FF3D71", margin: "4px 0 20px",
+      }}>
+        {parseFloat(stats.returnPct) >= 0 ? "+" : ""}{stats.returnPct}% return
+      </div>
+      <div style={{
+        background: "rgba(255,255,255,0.04)", borderRadius: 12, padding: 20,
+        maxWidth: 360, width: "100%", marginBottom: 20,
+      }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13, fontFamily: "'IBM Plex Mono', monospace" }}>
+          <div style={{ textAlign: "left", color: "#aaa" }}>Final Value</div>
+          <div style={{ textAlign: "right", fontWeight: 700 }}>${stats.finalValue.toFixed(2)}</div>
+          <div style={{ textAlign: "left", color: "#aaa" }}>Trades Made</div>
+          <div style={{ textAlign: "right", fontWeight: 700 }}>{stats.totalTrades}</div>
+          <div style={{ textAlign: "left", color: "#aaa" }}>Stocks Traded</div>
+          <div style={{ textAlign: "right", fontWeight: 700 }}>{stats.uniqueStocks}/4</div>
+        </div>
+      </div>
+      {earned.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 11, color: "#666", marginBottom: 8, fontFamily: "'Press Start 2P', monospace" }}>BADGES EARNED</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+            {earned.map(b => (
+              <div key={b.id} style={{
+                background: "rgba(255,214,0,0.1)", border: "1px solid #FFD60033",
+                borderRadius: 8, padding: "6px 12px", fontSize: 13,
+              }}>
+                {b.icon} {b.label}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <button onClick={onRestart} style={{
+        fontFamily: "'Press Start 2P', monospace", fontSize: 14, background: "#FFD600",
+        color: "#0a0e1a", border: "none", borderRadius: 10, padding: "14px 36px",
+        cursor: "pointer", letterSpacing: 1,
+      }}>TRADE AGAIN</button>
+    </div>
+  );
+}
